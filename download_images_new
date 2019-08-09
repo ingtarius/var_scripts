@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+
+""" Restore images  """
+
+import os
+import sys
+import random
+import argparse
+from pathlib import Path
+
+import asyncio
+import aiohttp
+import psycopg2
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+import socket
+
+IMAGE_ADDRESS = "imageg.example.com"
+DEFAULT_CONNECTIONS = 100
+CONN_STRING_DB = "host='db1' dbname='example_new' user='postgres' port=1111"
+
+
+def format_id(image_id):
+    """ Return formatted id - zero front padding """
+    return "%06d" % int(image_id)
+ 
+
+# Create url from id
+def url_from_id(image_id, size, node_id):
+    """ 
+    Create url from id 
+    Example: https://images.example.com/123456.jpg
+    """
+    full_name = "https://%s.%s/%s/%s.jpg" % (node_id, IMAGE_ADDRESS, size, image_id)
+    return full_name
+ 
+
+# get content and write it to file
+def write_to_file(dirname, filename, content):
+    try:
+        os.makedirs(dirname, exist_ok=True)
+        #f = open(dirname + filename, 'wb')
+        #f.write(content)
+        #f.close()
+        with open(dirname + filename, 'wb') as f:
+             f.write(content)
+             f.close()
+    except Exception as e:
+        print("caught exception '%s'" % e)
+
+@asyncio.coroutine
+def download_file(image_id, sizes, root_folder, session, node_id, executor):
+    # this routine is protected by a semaphore
+    for size in sizes:
+        url = url_from_id(image_id, size, node_id)
+        try:
+            response = yield from session.get(url)
+        except asyncio.TimeoutError:
+            continue
+        if not response.status == 200:
+            yield from response.close()
+            continue
+        else:
+            content = yield from response.read()
+    right_id = format_id(image_id)
+    dirname = "%s/%s/%s/%s/" % (root_folder, right_id[-2:], right_id[-4:-2], right_id[-6:-4])
+    filename = "%s_%s.jpg" % (image_id, size)
+    write_file = executor.submit(write_to_file(dirname, filename, content))
+ 
+def get_image_ids(node_id, limit):
+    # Get images list from DB
+    with psycopg2.connect(CONN_STRING_DB) as conn_db:
+        
+        print('Getting image ids from db ...')
+        cursor_db = conn_db.cursor()
+        cursor_db.execute("select image_id from items_images where image_id % 100 IN ({}) LIMIT {};".format(node_id, limit))
+        #cursor_db.execute("select image_id from items_images where image_id % 100 IN (" + str(node_id) + ") ;")
+    
+        image_ids = cursor_db.fetchall()
+        print('Got {:,} images!'.format(len(image_ids)))
+    return image_ids
+ 
+
+def main(args):
+    # avoid to many requests(coroutines) the same time.
+    # limit them by setting semaphores (simultaneous requests)
+    # Получаем id картинок из базы. Только items
+    image_ids = get_image_ids(args.node_id, limit=args.limit)
+    # Готовим треды для работы
+    executor = concurrent.futures.ThreadPoolExecutor(args.threads)
+    print('threads created')
+    # Готовим пул коннектов
+    conn = aiohttp.TCPConnector(limit=args.connections, verify_ssl=False, use_dns_cache=True, family=socket.AF_INET)
+    print('connector created')
+    #session = aiohttp.ClientSession(connector=conn)
+    session = aiohttp.ClientSession(connector=conn, connector_owner=False, read_timeout=0, raise_for_status=False)
+    print('client created')
+    coroutines = [download_file(image_id[0], args.sizes, args.root_folder, session, args.node_id, executor) for image_id in image_ids]
+    eloop = asyncio.get_event_loop()
+    eloop.run_until_complete(asyncio.gather(*coroutines, return_exceptions=True))
+    session.close()
+    conn.close()
+    eloop.close()
+    print('Done downloading!')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(usage=__doc__)
+    parser.add_argument('level', type=int, choices=[1, 2])
+    parser.add_argument('node_id', type=int, choices=range(00, 100))
+    parser.add_argument('--connections', type=int, default=DEFAULT_CONNECTIONS)
+    parser.add_argument('--root_folder', default='/var/local/example/')
+    parser.add_argument('--limit', default='110000000000000')
+    parser.add_argument('--threads', type=int, default=200)
+    args = parser.parse_args()
+    if args.level == 1:
+        sizes = ['140x105']
+    elif args.level == 2:
+        sizes = ['640x480', '1280x960']
+    args.sizes = sizes
+    return args
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    main(args)
